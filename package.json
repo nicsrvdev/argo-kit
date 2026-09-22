@@ -1,0 +1,13 @@
+{
+  "name": "nic-kit",
+  "version": "0.1.0",
+  "description": "Minimal niccore + niclink launcher over Node.js. vless-link first, all config via env.",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "license": "GPL-3.0-only"
+}

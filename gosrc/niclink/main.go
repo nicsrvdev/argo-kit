@@ -3,7 +3,8 @@ package main
 import (
 	"fmt"
 	"os"
-	"time"
+	"os/signal"
+	"syscall"
 
 	"github.com/urfave/cli/v2"
 
@@ -12,7 +13,8 @@ import (
 )
 
 var (
-	Version   = "2026.9.1"
+	// Version 默认 dev：正式构建由 -ldflags "-X main.Version=<tag>" 注入（见 release workflow / Dockerfile）
+	Version   = "dev"
 	BuildTime = "unknown"
 	BuildType = ""
 
@@ -50,7 +52,18 @@ func main() {
 	// No token/url-specified invocation runs quick mode through the same action.
 	app.Action = cliutil.ConfiguredAction(runAction)
 
-	tunnel.Init(buildInfo, make(chan struct{}))
+	// 优雅关闭：SIGTERM/SIGINT 时关闭 graceShutdownC，通知 tunnel 做 graceful drain，
+	// 而不是像之前那样传一个永远没人 close 的匿名 channel 导致进程被硬杀
+	graceShutdownC := make(chan struct{})
+	sigC := make(chan os.Signal, 1)
+	signal.Notify(sigC, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigC
+		signal.Stop(sigC)
+		close(graceShutdownC)
+	}()
+
+	tunnel.Init(buildInfo, graceShutdownC)
 	runApp(app)
 }
 
@@ -62,5 +75,4 @@ func runApp(app *cli.App) {
 		_, _ = fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	time.Sleep(0)
 }

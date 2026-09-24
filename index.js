@@ -67,7 +67,7 @@ const USER_CONFIG = {
 };
 // ================= 配置区结束，以下为程序代码 =================
 import { execFile, spawn, spawnSync } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { connect as tlsConnect } from "node:tls";
 import { createSocket } from "node:dgram";
 import { promises as fs } from "node:fs";
@@ -263,6 +263,8 @@ function loadConfig() {
     kitFile: str("KIT_FILE", ".npm/kit.txt"),
     binTtlSec: int("BIN_TTL_SEC", 120),
     nodePrefix: str("NODE_PREFIX", ""),
+    // 订阅鉴权：留空=不鉴权（默认行为不变）；设置后 /sub、/kit 需 ?token= 或 Authorization: Bearer
+    subToken: str("SUB_TOKEN", ""),
   };
 
   cfg.nezhaEnabled = cfg.nezhaServer !== "" && cfg.nezhaKey !== "";
@@ -276,12 +278,12 @@ function loadConfig() {
   if (cfg.cfNodeId === "") cfg.cfNodeId = cfg.uuid;
   cfg.cfEnabled =
     cfg.cfWorkerUrl !== "" && cfg.cfSecret !== "" && cfg.cfNodeId !== "";
+  const warnings = [];
   if (!["auto", "http"].includes(cfg.cfConnectionMode)) {
     warnings.push(`CF_CONNECTION_MODE unknown (${cfg.cfConnectionMode}), using auto`);
     cfg.cfConnectionMode = "auto";
   }
 
-  const warnings = [];
   if (!cfg.nezhaEnabled && (cfg.nezhaServer || cfg.nezhaKey)) {
     warnings.push("NEZHA_SERVER/NEZHA_KEY incomplete, nezha disabled");
   }
@@ -579,7 +581,8 @@ function scheduleBinaryTtl(cfg, runner) {
 
 async function downloadFile(url, dest, opts = {}) {
   const minSize = opts.minSize || 0;
-  await fs.mkdir(join(dest, "..").replace(/\/[^/]+$/, "") || ".", { recursive: true }).catch(() => {});
+  // 确保 dest 的父目录存在（原先正则多剥了一层，实际建的是祖父目录）
+  await fs.mkdir(join(dest, ".."), { recursive: true }).catch(() => {});
   // 清掉上次失败的残留，避免断点续传式的半截文件被当成完整包
   await fs.rm(dest, { force: true }).catch(() => {});
   if (have("curl")) {
@@ -1290,20 +1293,25 @@ async function osRelease() {
   }
 }
 
+// 主机元信息：os/arch/kernel/cpu 型号等启动后不变，只读一次缓存
+let hostMetaCache = null;
 async function hostMeta() {
-  const osName = platform() === "linux" ? await osRelease() : platform();
-  const a = arch() === "x64" ? "amd64" : arch() === "arm64" ? "arm64" : arch();
-  let kernel = "";
-  let cpuModel = "";
-  let cores = String(cpus().length || 0);
-  if (platform() === "linux") {
-    const ver = await readText("/proc/version");
-    kernel = ver.trim().slice(0, 128);
-    const cpuinfo = await readText("/proc/cpuinfo");
-    const m = cpuinfo.match(/model name\s*:\s*(.+)/);
-    if (m) cpuModel = m[1].trim().slice(0, 128);
+  if (!hostMetaCache) {
+    const osName = platform() === "linux" ? await osRelease() : platform();
+    const a = arch() === "x64" ? "amd64" : arch() === "arm64" ? "arm64" : arch();
+    let kernel = "";
+    let cpuModel = "";
+    const cores = String(cpus().length || 0);
+    if (platform() === "linux") {
+      const ver = await readText("/proc/version");
+      kernel = ver.trim().slice(0, 128);
+      const cpuinfo = await readText("/proc/cpuinfo");
+      const m = cpuinfo.match(/model name\s*:\s*(.+)/);
+      if (m) cpuModel = m[1].trim().slice(0, 128);
+    }
+    hostMetaCache = { os: osName, arch: a, kernel, cpuModel, cores };
   }
-  return { os: osName, arch: a, kernel, cpuModel, cores, hostname: hostname() };
+  return { ...hostMetaCache, hostname: hostname() };
 }
 
 async function loadAvg() {
@@ -1666,6 +1674,7 @@ function createCfProbe(cfg) {
     serverCfg: {},           // 原始下发 key-values（health 可见）
     samples: [],             // collect 采样累积（上报成功后清空，对齐官方 samples）
     lastSampleAt: 0,
+    lastReportAt: 0,         // 上次 POST 上报时间戳（HTTP 模式/WSS 兜底按上报间隔节流）
     lastConfigStateAt: 0,
     lastConfigStateMd5: "",
     lastNet: null,
@@ -1928,6 +1937,7 @@ function createCfProbe(cfg) {
     return String(r.loss < 0 ? 100 : r.loss);
   }
   // 后台采样：每 20s 对 8 个点各测 1 次（对齐官方 metricsProbeInterval/SampleCount）
+  // 8 个点并行探测（每点独立 1.5s 超时），避免串行最坏 12s 占满采样窗口
   async function probeTick() {
     const now = Date.now();
     const kind = effPingMode();
@@ -1935,13 +1945,16 @@ function createCfProbe(cfg) {
     const jobs = [
       ["ct", t.ct], ["cu", t.cu], ["cm", t.cm], ["bd", t.bd],
       ["node1", t.node1], ["node2", t.node2], ["node3", t.node3], ["node4", t.node4],
-    ];
-    for (const [, target] of jobs) {
-      if (!String(target || "").trim()) continue;
+    ].filter(([, target]) => String(target || "").trim());
+    const results = await Promise.all(jobs.map(async ([, target]) => {
       try {
-        const r = await measureProbe(kind, target, 1);
-        histAdd(probeKey(kind, target), r);
-      } catch {}
+        return [target, await measureProbe(kind, target, 1)];
+      } catch {
+        return [target, null];
+      }
+    }));
+    for (const [target, r] of results) {
+      if (r) histAdd(probeKey(kind, target), r);
     }
     state.lastProbeAt = now;
   }
@@ -2520,7 +2533,7 @@ function createCfProbe(cfg) {
       // collect 采样累积（对齐官方 samples；上报成功后清空）
       const ci = effCollectInterval();
       if (ci > 0) {
-        state.samples.push({ ts: clockSnapshot(Date.now()).local_ts, metrics: sampleMetrics(body.metrics) });
+        pushSample(clockSnapshot(Date.now()).local_ts, sampleMetrics(body.metrics));
         state.lastSampleAt = Date.now();
       }
       const text = JSON.stringify(body);
@@ -2549,12 +2562,22 @@ function createCfProbe(cfg) {
     };
   }
 
-  async function postOnce(isFallback) {
+  // samples 上限：上报失败时不再无界增长（2s 采集间隔下约保留 8 分钟窗口）
+  const MAX_SAMPLES = 240;
+  function pushSample(ts, metrics) {
+    state.samples.push({ ts, metrics });
+    if (state.samples.length > MAX_SAMPLES) {
+      state.samples.splice(0, state.samples.length - MAX_SAMPLES);
+    }
+  }
+
+  async function postOnce(isFallback, skipSample) {
     try {
       const body = await collect();
       const ci = effCollectInterval();
-      if (ci > 0) {
-        state.samples.push({ ts: clockSnapshot(Date.now()).local_ts, metrics: sampleMetrics(body.metrics) });
+      // 同一节拍里 tick() 已采样过则不再重复 push，避免每个 report 塞两份样本
+      if (ci > 0 && !skipSample) {
+        pushSample(clockSnapshot(Date.now()).local_ts, sampleMetrics(body.metrics));
         state.lastSampleAt = Date.now();
       }
       const startedAt = Date.now();
@@ -2597,17 +2620,20 @@ function createCfProbe(cfg) {
     if (ci > 0 && (!state.lastSampleAt || now - state.lastSampleAt >= ci)) {
       try {
         const body = await collect();
-        state.samples.push({ ts: clockSnapshot(now).local_ts, metrics: sampleMetrics(body.metrics) });
+        pushSample(clockSnapshot(now).local_ts, sampleMetrics(body.metrics));
         state.lastSampleAt = now;
       } catch {}
     }
     if (wssConnected) return; // WSS 节奏由 wssTickLoop 负责
-    if (!wssOn) { await postOnce(false); return; }
     if (wssPaused()) {
       logger.debug(`POST fallback delayed reason=${state.wssPauseReason}`);
       return;
     }
-    await postOnce(false);
+    // POST 上报按上报间隔节流：HTTP 模式和 WSS 断连兜底都不能每节拍上报，
+    // 否则每 2s 打一次全量 report（ri 算出来却从没被用过）。
+    if (state.lastReportAt && now - state.lastReportAt < ri) return;
+    state.lastReportAt = now;
+    await postOnce(false, true);
   }
   function tickIntervalMs() {
     // 对齐官方 tickInterval：WSS 间隔与 collect 取 GCD
@@ -2715,6 +2741,7 @@ function createCfProbe(cfg) {
 // ---- src/runner.js ----
 const MAX_RESTARTS = 30; // 单进程最大自动重启次数，防止配置错误刷屏
 const RESTART_BASE_MS = 5000;
+const RESTART_RESET_MS = 10 * 60 * 1000; // 连续健康运行超过 10 分钟，重启计数清零（偶发崩溃不累加上古早次数）
 
 class Runner {
   constructor() {
@@ -2722,6 +2749,7 @@ class Runner {
     this.stopping = false;
     this.timers = new Map(); // name -> timeout
     this.restarts = new Map(); // name -> count
+    this.spawnedAt = new Map(); // name -> 上次 spawn 成功的时间戳
     this.refetchers = new Map(); // name -> async () => binPath | null（TTL 删二进制后重下用）
   }
 
@@ -2761,6 +2789,7 @@ class Runner {
     // stderr 同 stdout 合并处理；域名监听拿到首个域名后自动解绑
     child.stderr && child.stderr.on("data", onChunk);
     this.children.set(name, child);
+    this.spawnedAt.set(name, Date.now());
     // spawn 钩子：每次（含重启）都触发，调用方自行挂监听
     try {
       const hooks = (this.spawnHooks && this.spawnHooks.get(name)) || [];
@@ -2789,6 +2818,11 @@ class Runner {
 
   scheduleRestart(name, bin, args, opts, reason) {
     if (this.stopping) return;
+    // 上次 spawn 后健康运行超过阈值：清零计数，偶发崩溃不该累加上古早的次数
+    const spawnedAt = this.spawnedAt.get(name) || 0;
+    if (spawnedAt && Date.now() - spawnedAt > RESTART_RESET_MS) {
+      this.restarts.set(name, 0);
+    }
     const n = (this.restarts.get(name) || 0) + 1;
     this.restarts.set(name, n);
     if (n > MAX_RESTARTS) {
@@ -2951,6 +2985,26 @@ async function servePublicFile(res, name) {
     res.end("not found\n");
   }
 }
+// /sub、/kit 鉴权：SUB_TOKEN 留空=不鉴权；设置后接受 ?token= 或 Authorization: Bearer。
+// 纯函数，便于测试。Exposed for tests.
+function checkSubAuth(req, cfg) {
+  const token = String((cfg && cfg.subToken) || "").trim();
+  if (!token) return true;
+  const ok = (cand) => {
+    if (typeof cand !== "string" || !cand) return false;
+    const a = Buffer.from(cand);
+    const b = Buffer.from(token);
+    return a.length === b.length && timingSafeEqual(a, b);
+  };
+  try {
+    const url = new URL(req.url || "/", "http://localhost");
+    if (ok(url.searchParams.get("token"))) return true;
+  } catch {}
+  const h = req.headers && req.headers.authorization;
+  if (typeof h === "string" && /^bearer /i.test(h) && ok(h.slice(7).trim())) return true;
+  return false;
+}
+
 function startServer(cfg, state) {
   const server = createServer((req, res) => {
     const url = new URL(req.url || "/", `http://localhost`);
@@ -2960,6 +3014,11 @@ function startServer(cfg, state) {
       return;
     }
     if (url.pathname === "/sub" || url.pathname === "/kit") {
+      if (!checkSubAuth(req, cfg)) {
+        res.writeHead(401, { "content-type": "text/plain" });
+        res.end("unauthorized\n");
+        return;
+      }
       const links = buildSubEntries(cfg, state);
       res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
       res.end(links.join("\n") + "\n");
@@ -3366,7 +3425,12 @@ async function main() {
   scheduleBinaryTtl(cfg, runner);
 }
 
-main().catch((e) => {
-  logger.error(e.stack || e.message);
-  process.exit(1);
-});
+// 测试时 NIC_SKIP_MAIN=1：只 import 纯函数/类，不启动服务（见 test/）
+if (process.env.NIC_SKIP_MAIN !== "1") {
+  main().catch((e) => {
+    logger.error(e.stack || e.message);
+    process.exit(1);
+  });
+}
+
+export { loadConfig, createCfProbe, Runner, checkSubAuth, wsFrameEncode, wsFrameDecodeOne, MAX_RESTARTS, RESTART_RESET_MS };

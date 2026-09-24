@@ -7,10 +7,11 @@ COPY gosrc/go.mod gosrc/go.sum ./
 RUN go mod download github.com/sagernet/sing-box github.com/cloudflare/cloudflared || true
 COPY gosrc/ ./
 ARG TARGETARCH
+ARG NICLINK_VERSION=dev
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH \
     go build -tags with_quic -trimpath -ldflags "-s -w" -o /out/niccore ./niccore && \
     CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH \
-    go build -trimpath -ldflags "-s -w" -o /out/niclink ./niclink
+    go build -trimpath -ldflags "-s -w -X main.Version=${NICLINK_VERSION}" -o /out/niclink ./niclink
 
 FROM node:20-alpine
 
@@ -39,5 +40,8 @@ ENV PORT=3000 \
     NODE_OPTIONS="--max-old-space-size=96"
 
 EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null || exit 1
 
 CMD ["node", "index.js"]

@@ -47,6 +47,7 @@ docker rmi ghcr.io/nicsrvdev/nic-kit:latest
 | `CF_PING_MODE` | `tcp` | `tcp`/`icmp` 初始值；面板可下发覆盖（`icmp` 在 Node 无特权时自动回退 `tcp`） |
 | `CF_IFACE` | — | 指定统计网卡 |
 | `KIT_FILE` / `NODE_PREFIX` | `.npm/kit.txt` / 国家码 | 订阅落盘（留空即默认，缺目录自动建） / 名称前缀（`custom`=IP 后缀） |
+| `SUB_TOKEN` | — | 留空=`/sub`、`/kit` 不鉴权；设置后需 `?token=` 或 `Authorization: Bearer` |
 | `BIN_DIR` / `BIN_TTL_SEC` | `./.bin` / `120` | 二进制目录 / 启动后删除二进制的等待秒数（`0`=不删） |
 | `GH_PROXY` / `GH_TOKEN` | — | GitHub 代理 / API token |
 | `NICCORE_VERSION` / `NICLINK_VERSION` | 跟随代码 | 留空=默认版；`latest`=最新 release |
@@ -59,7 +60,7 @@ docker rmi ghcr.io/nicsrvdev/nic-kit:latest
 
 - `GET /`：工具页（UUID 生成 + JS 混淆，混淆引擎 CDN 优先、失败回退本地）
 - `GET /health`：状态 JSON（`domain` / `at_link_mode` / `domain_check_*` / `cf_*` 上报计数 / 各探针开关）
-- `GET /sub`（`/kit` 同）：vless-link 订阅（域名就绪前返回占位行）；同内容 base64 编码后默认落盘 `.npm/kit.txt`（域名就绪 15s 后首次写入，此后每 60s 刷新，域名变更即时重写）
+- `GET /sub`（`/kit` 同）：vless-link 订阅（域名就绪前返回占位行）；设置 `SUB_TOKEN` 后需 `?token=` 或 `Authorization: Bearer` 鉴权，否则 401；同内容 base64 编码后默认落盘 `.npm/kit.txt`（域名就绪 15s 后首次写入，此后每 60s 刷新，域名变更即时重写）
 - 日志脱敏：`vless`/`hy2`/`hysteria2`/`argo` 不落日志（中性化为 `v`/`direct-udp`/`direct-tcp`/`link`/`edge`）；全大写变量名（如 `HY2_PORT`）原样保留以便定位配置
 
 ## 源码与发版
@@ -73,6 +74,8 @@ CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o niclink-linux-amd64 ./nicli
 ```
 
 push `main` 即全自动发版：二进制 tag（取 `index.js` 中 `FALLBACK`）自动移到 HEAD 并重发 release；镜像自动推 GHCR `latest`。
+
+Node 侧单测（无第三方依赖）：`npm test`（`test/`：配置校验 / WSS 帧编解码 / 订阅鉴权 / Runner 重启计数）。
 
 ## 依赖
 

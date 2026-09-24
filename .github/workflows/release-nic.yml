@@ -7,6 +7,7 @@ on:
       - "gosrc/**"
       - "index.js"
       - "package.json"
+      - "test/**"
       - ".github/workflows/release-nic.yml"
   workflow_dispatch:
 
@@ -18,7 +19,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  js-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Run JS tests
+        run: npm test
+
   build:
+    needs: js-test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -43,21 +55,25 @@ jobs:
 
       - name: Build amd64
         working-directory: gosrc
+        env:
+          NICLINK_TAG: ${{ steps.tags.outputs.niclink_tag }}
         run: |
           CGO_ENABLED=0 go build -tags with_quic -trimpath -ldflags "-s -w" -o niccore-linux-amd64 ./niccore
-          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o niclink-linux-amd64 ./niclink
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.Version=${NICLINK_TAG}" -o niclink-linux-amd64 ./niclink
 
       - name: Build arm64
         working-directory: gosrc
+        env:
+          NICLINK_TAG: ${{ steps.tags.outputs.niclink_tag }}
         run: |
           CGO_ENABLED=0 GOARCH=arm64 go build -tags with_quic -trimpath -ldflags "-s -w" -o niccore-linux-arm64 ./niccore
-          CGO_ENABLED=0 GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o niclink-linux-arm64 ./niclink
+          CGO_ENABLED=0 GOARCH=arm64 go build -trimpath -ldflags "-s -w -X main.Version=${NICLINK_TAG}" -o niclink-linux-arm64 ./niclink
 
       - uses: docker/setup-qemu-action@v3
       - name: Smoke check amd64
         working-directory: gosrc
         run: |
-          ./niccore-linux-amd64 check --help 2>&1 | head -3 || true
+          ./niccore-linux-amd64 run --help 2>&1 | head -3
           ./niclink-linux-amd64 run --help 2>&1 | head -3
 
       - name: Rename with tag
